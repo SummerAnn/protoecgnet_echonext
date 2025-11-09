@@ -4,6 +4,8 @@ import wfdb
 import ast
 import os
 import torch
+from pathlib import Path
+from typing import Dict, Optional, Tuple
 from sklearn.preprocessing import StandardScaler
 import pickle
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
@@ -15,6 +17,53 @@ from scipy.signal import butter, filtfilt
 DATASET_PATH = "/gpfs/data/bbj-lab/users/sethis/physionet.org/files/ptb-xl/1.0.3"
 STANDARDIZATION_PATH = '/gpfs/data/bbj-lab/users/sethis/experiments/preprocessing'
 SCP_GROUP_PATH = "scp_statementsRegrouped2.csv"
+
+# ---------------------------------------------------------------------
+# EchoNext configuration (optional)
+# ---------------------------------------------------------------------
+_ECHONEXT_CACHE: Dict[Tuple[str, str], Dict[str, object]] = {}
+
+def _get_echonext_config() -> Optional[Dict[str, object]]:
+    processed_dir = os.environ.get("ECHONEXT_PROCESSED_DIR")
+    if not processed_dir:
+        return None
+
+    processed_path = Path(processed_dir).expanduser().resolve()
+    if not processed_path.exists():
+        raise FileNotFoundError(
+            f"[EchoNext] Processed directory not found: {processed_path}"
+        )
+
+    mode = os.environ.get("ECHONEXT_TASK_MODE", "multilabel").lower()
+    if mode not in {"binary", "multilabel", "multitask"}:
+        raise ValueError(f"[EchoNext] Unsupported ECHONEXT_TASK_MODE={mode}")
+
+    labels_dir = os.environ.get("ECHONEXT_LABELS_DIR")
+    labels_path = Path(labels_dir).expanduser().resolve() if labels_dir else processed_path
+
+    limit = os.environ.get("ECHONEXT_LIMIT_SAMPLES")
+    limit_samples = int(limit) if limit and limit.isdigit() else None
+
+    multitask_cols_env = os.environ.get("ECHONEXT_MULTITASK_COLUMNS")
+    multitask_columns = None
+    if multitask_cols_env:
+        multitask_columns = [int(idx.strip()) for idx in multitask_cols_env.split(",") if idx.strip().isdigit()]
+
+    return {
+        "processed_dir": processed_path,
+        "labels_dir": labels_path,
+        "task_mode": mode,
+        "limit_samples": limit_samples,
+        "multitask_columns": multitask_columns,
+    }
+
+def _ensure_echonext_cache(cfg: Dict[str, object]) -> Dict[str, object]:
+    key = (str(cfg["processed_dir"]), cfg["task_mode"])
+    cached = _ECHONEXT_CACHE.get(key)
+    if cached is None:
+        cached = _load_echonext_data(cfg)
+        _ECHONEXT_CACHE[key] = cached
+    return cached
 
 def remove_baseline_wander(X, sampling_rate=100, cutoff=0.5, order=1):
     """
@@ -54,9 +103,10 @@ def plot_ecg(
     import matplotlib.pyplot as plt
     import numpy as np
 
-    if raw_ecg.shape == (12, 1000):
+    if raw_ecg.shape[0] == 12 and raw_ecg.shape[1] != 12:
         raw_ecg = raw_ecg.T
-    assert raw_ecg.shape == (1000, 12)
+    if raw_ecg.shape[1] != 12:
+        raise ValueError(f"Unexpected ECG shape: {raw_ecg.shape}")
 
     lead_names = ['I', 'II', 'III', 'aVR', 'aVL', 'aVF',
                   'V1', 'V2', 'V3', 'V4', 'V5', 'V6']
@@ -176,6 +226,13 @@ def apply_standardizer(X, ss, mode):
         return X_std.reshape(X_shape)  # Restore (N, 12, H, W)
 
 def load_label_mappings(custom_groups=False, prototype_category=None):
+    echonext_cfg = _get_echonext_config()
+    if echonext_cfg is not None:
+        if custom_groups:
+            raise NotImplementedError("[EchoNext] custom_groups are not supported with EchoNext data.")
+        cache = _ensure_echonext_cache(echonext_cfg)
+        return cache["label_map"]
+
     if custom_groups:
         label_df = pd.read_csv(os.path.join(DATASET_PATH, SCP_GROUP_PATH), index_col=0) 
 
@@ -345,6 +402,18 @@ class PTBXL_Dataset_2D(Dataset):
 
 # DataLoader Function
 def get_dataloaders(batch_size=32, mode="2D", sampling_rate=100, label_set="superdiagnostic", work_num=4, return_sample_ids=False, custom_groups=False, standardize=False, remove_baseline=False):
+    echonext_cfg = _get_echonext_config()
+    if echonext_cfg is not None:
+        cache = _ensure_echonext_cache(echonext_cfg)
+        loaders = _build_echonext_dataloaders(
+            cache,
+            batch_size=batch_size,
+            as_2d=(mode == "2D"),
+            num_workers=work_num,
+            return_sample_ids=return_sample_ids,
+        )
+        return loaders
+
     df = pd.read_csv(os.path.join(DATASET_PATH, "ptbxl_database.csv"), index_col="ecg_id")
     df.scp_codes = df.scp_codes.apply(lambda x: ast.literal_eval(x)) 
     
@@ -405,3 +474,266 @@ def get_dataloaders(batch_size=32, mode="2D", sampling_rate=100, label_set="supe
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=work_num)
     
     return train_loader, val_loader, test_loader, class_weights
+
+
+# ---------------------------------------------------------------------
+# EchoNext helpers
+# ---------------------------------------------------------------------
+class EchoNextDataset(Dataset):
+    def __init__(
+        self,
+        features: np.memmap,
+        labels: Optional[np.memmap],
+        as_2d: bool,
+        sample_ids: np.ndarray,
+        indices: np.ndarray,
+        return_sample_ids: bool,
+    ):
+        self._features = features
+        self._labels = labels
+        self._as_2d = as_2d
+        self._sample_ids = sample_ids
+        self._indices = indices
+        self._return_ids = return_sample_ids
+
+    def __len__(self) -> int:
+        return int(self._indices.shape[0])
+
+    def __getitem__(self, idx):
+        real_idx = int(self._indices[idx])
+        x = np.asarray(self._features[real_idx])
+        if x.ndim == 2:
+            if x.shape[0] != 12 and x.shape[1] == 12:
+                x = x.T
+        elif x.ndim == 3:
+            # squeeze channel dimension if present
+            if x.shape[0] == 1 and x.shape[1] == 12:
+                x = x[0]
+        x_t = torch.from_numpy(x.astype(np.float32, copy=False))
+        if self._as_2d:
+            if x_t.ndim == 2:
+                x_t = x_t.unsqueeze(0)
+        labels = None
+        if self._labels is not None:
+            y = np.asarray(self._labels[real_idx])
+            if y.ndim == 0:
+                y = np.array([y], dtype=np.float32)
+            labels = torch.from_numpy(y.astype(np.float32, copy=False))
+
+        if self._return_ids:
+            sample_id = int(self._sample_ids[real_idx])
+            if labels is None:
+                return x_t, sample_id
+            return x_t, labels, sample_id
+
+        if labels is None:
+            return x_t
+        return x_t, labels
+
+
+def _load_echonext_data(cfg: Dict[str, object]) -> Dict[str, object]:
+    processed_dir: Path = cfg["processed_dir"]
+    task_mode: str = cfg["task_mode"]
+
+    splits = {}
+    for split in ("train", "val", "test"):
+        x_path = processed_dir / f"X_{split}.npy"
+        if not x_path.exists():
+            raise FileNotFoundError(f"[EchoNext] Missing feature file: {x_path}")
+        features = np.load(x_path, mmap_mode="r")
+
+        labels = _load_echonext_labels(cfg, split, expected_len=features.shape[0])
+        sample_ids = _load_echonext_ids(processed_dir, split, expected_len=features.shape[0])
+
+        splits[split] = {
+            "features": features,
+            "labels": labels,
+            "sample_ids": sample_ids,
+        }
+
+    label_names = _resolve_echonext_label_names(cfg, splits["train"]["labels"])
+    n_classes = splits["train"]["labels"].shape[1] if splits["train"]["labels"] is not None else 1
+
+    label_map = {
+        "all": label_names,
+        "train_labels": splits["train"]["labels"],
+        "val_labels": splits["val"]["labels"],
+        "test_labels": splits["test"]["labels"],
+        "n_classes": n_classes,
+        "label_names": label_names,
+        "custom_groups": False,
+        "label_set": "all",
+        "processed_dir": str(processed_dir),
+        "mode": task_mode,
+    }
+
+    return {
+        "config": cfg,
+        "splits": splits,
+        "label_map": label_map,
+    }
+
+
+def _build_echonext_dataloaders(
+    cache: Dict[str, object],
+    batch_size: int,
+    as_2d: bool,
+    num_workers: int,
+    return_sample_ids: bool,
+):
+    cfg = cache["config"]
+    splits = cache["splits"]
+    limit = cfg.get("limit_samples")
+
+    datasets = {}
+    subset_indices = {}
+    for split_name, payload in splits.items():
+        num_examples = payload["features"].shape[0]
+        indices = np.arange(num_examples, dtype=np.int64)
+        if limit is not None:
+            indices = indices[: limit]
+        sample_ids = payload["sample_ids"]
+        if sample_ids.shape[0] != num_examples:
+            sample_ids = np.arange(num_examples, dtype=np.int64)
+        dataset = EchoNextDataset(
+            features=payload["features"],
+            labels=payload["labels"],
+            as_2d=as_2d,
+            sample_ids=sample_ids,
+            indices=indices,
+            return_sample_ids=return_sample_ids,
+        )
+        datasets[split_name] = dataset
+        subset_indices[split_name] = indices
+
+    class_weights = _compute_echonext_class_weights(
+        splits["train"]["labels"],
+        subset_indices["train"],
+    )
+
+    train_loader = DataLoader(
+        datasets["train"],
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        datasets["val"],
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    test_loader = DataLoader(
+        datasets["test"],
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    return train_loader, val_loader, test_loader, class_weights
+
+
+def _compute_echonext_class_weights(labels: Optional[np.memmap], indices: np.ndarray) -> torch.Tensor:
+    if labels is None:
+        return torch.ones(1, dtype=torch.float32)
+    subset = np.asarray(labels)[indices]
+    if subset.ndim == 1:
+        subset = subset[:, None]
+    total = subset.shape[0]
+    positives = subset.sum(axis=0).astype(np.float32)
+    weights = (total - positives) / (positives + 1e-6)
+    return torch.from_numpy(weights.astype(np.float32))
+
+
+def _load_echonext_labels(cfg: Dict[str, object], split: str, expected_len: int) -> Optional[np.memmap]:
+    mode = cfg["task_mode"]
+    processed_dir: Path = cfg["processed_dir"]
+    labels_dir: Path = cfg["labels_dir"]
+
+    candidates = []
+    if mode == "binary":
+        candidates.extend([
+            processed_dir / f"{split}_binary.npy",
+            processed_dir / f"y_{split}_binary.npy",
+            processed_dir / f"y_{split}.npy",
+        ])
+    elif mode == "multilabel":
+        candidates.extend([
+            processed_dir / f"{split}_multilabel.npy",
+            processed_dir / f"y_{split}_multilabel.npy",
+        ])
+    elif mode == "multitask":
+        candidates.extend([
+            processed_dir / f"{split}_multitask.npy",
+            processed_dir / f"y_{split}_multitask.npy",
+            labels_dir / f"EchoNext_{split}_labels_multilabel.npy",
+            processed_dir / f"{split}_multilabel.npy",
+            processed_dir / f"y_{split}_multilabel.npy",
+        ])
+    else:
+        raise ValueError(f"[EchoNext] Unsupported task mode: {mode}")
+
+    selected = None
+    for cand in candidates:
+        if cand.exists():
+            selected = np.load(cand, mmap_mode="r")
+            break
+
+    if selected is None:
+        raise FileNotFoundError(f"[EchoNext] Could not locate label file for split '{split}' (mode={mode}).")
+
+    if selected.shape[0] != expected_len:
+        raise ValueError(
+            f"[EchoNext] Label length mismatch for split '{split}': "
+            f"{selected.shape[0]} vs expected {expected_len}"
+        )
+
+    # Normalise to 2D float32
+    if selected.ndim == 1:
+        selected = selected[:, None]
+    selected = selected.astype(np.float32, copy=False)
+
+    if mode == "binary":
+        if selected.shape[1] != 1:
+            selected = selected[:, :1]
+    elif mode == "multitask":
+        columns = cfg.get("multitask_columns")
+        if columns:
+            selected = selected[:, columns]
+        elif selected.shape[1] > 11:
+            selected = selected[:, :11]
+
+    return selected
+
+
+def _load_echonext_ids(processed_dir: Path, split: str, expected_len: int) -> np.ndarray:
+    candidate = processed_dir / f"pids_{split}.npy"
+    if candidate.exists():
+        arr = np.load(candidate, mmap_mode="r")
+        if arr.shape[0] == expected_len:
+            return np.asarray(arr)
+    return np.arange(expected_len, dtype=np.int64)
+
+
+def _resolve_echonext_label_names(cfg: Dict[str, object], labels: Optional[np.memmap]) -> list:
+    if labels is None:
+        return ["output"]
+    n_outputs = labels.shape[1] if labels.ndim > 1 else 1
+
+    override = os.environ.get("ECHONEXT_LABEL_NAMES")
+    if override:
+        parts = [name.strip() for name in override.split(",") if name.strip()]
+        if len(parts) == n_outputs:
+            return parts
+
+    csv_path = cfg["processed_dir"] / "labels_multilabel.csv"
+    if csv_path.exists():
+        header = pd.read_csv(csv_path, nrows=0)
+        candidates = [str(col) for col in header.columns]
+        if len(candidates) == n_outputs:
+            return candidates
+
+    return [f"class_{i}" for i in range(n_outputs)]

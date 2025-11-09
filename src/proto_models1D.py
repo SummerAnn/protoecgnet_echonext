@@ -5,9 +5,32 @@ from itertools import combinations
 from functools import reduce
 import operator as op
 from backbones import (
-    resnet1d18, resnet1d34, resnet1d50, 
+    resnet1d18, resnet1d34, resnet1d50,
     resnet1d101, resnet1d152
 )
+
+CUSTOM_BACKBONE_FNS = {}
+try:
+    from custom_backbones import (
+        simple_cnn,
+        deep_cnn,
+        wide_cnn,
+        cnn_gru,
+        cnn_lstm,
+        cnn_transformer,
+        inception_cnn,
+    )
+    CUSTOM_BACKBONE_FNS = {
+        "simple_cnn": simple_cnn,
+        "deep_cnn": deep_cnn,
+        "wide_cnn": wide_cnn,
+        "cnn_gru": cnn_gru,
+        "cnn_lstm": cnn_lstm,
+        "cnn_transformer": cnn_transformer,
+        "inception_cnn": inception_cnn,
+    }
+except ImportError:
+    CUSTOM_BACKBONE_FNS = {}
 
 def prototype_loss1d(logits, y_true, model, similarity_scores, class_weights, 
                    lam_clst, lam_sep, lam_spars, lam_div, lam_cnrst, use_contrastive=True):
@@ -52,7 +75,7 @@ def prototype_loss1d(logits, y_true, model, similarity_scores, class_weights,
     div_loss = torch.norm(torch.mm(P, P.T) - identity_matrix, p="fro") ** 2
     div_loss = div_loss / (model.num_prototypes ** 2)  # Normalize by number of prototypes
 
-    if use_contrastive:
+    if use_contrastive and model.label_cooccurrence is not None:
         # Flatten and normalize prototypes
         prototypes = model.prototype_vectors  # shape: (P, D)
         prototypes_flat = prototypes.view(prototypes.shape[0], -1)
@@ -349,6 +372,10 @@ class ProtoECGNet1D(nn.Module):
             "resnet1d101": resnet1d101, "resnet1d152": resnet1d152
         }
         
+        if backbone in CUSTOM_BACKBONE_FNS:
+            model = CUSTOM_BACKBONE_FNS[backbone](num_classes=num_classes, dropout=dropout)
+            return model, False
+
         if backbone not in backbones:
             raise ValueError(f"Unsupported 1D backbone: {backbone}")
 

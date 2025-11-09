@@ -28,9 +28,16 @@ def log_ecg_to_tensorboard_1d(
     
     # Ensure correct shape 
     ecg_signal = np.squeeze(ecg_signal)
-    if ecg_signal.shape == (12, 1000):
+    if ecg_signal.ndim != 2:
+        raise ValueError(f"Expected 2D ECG array, got shape {ecg_signal.shape}")
+
+    if ecg_signal.shape[0] == 12 and ecg_signal.shape[1] != 12:
         ecg_signal = ecg_signal.T
-    assert ecg_signal.shape == (1000, 12), f"Unexpected shape: {ecg_signal.shape}"
+
+    if ecg_signal.shape[1] != 12:
+        raise ValueError(f"Unexpected ECG shape: {ecg_signal.shape}")
+
+    sampling_rate = int(os.environ.get("ECHONEXT_SAMPLING_RATE", 100))
 
 
     display_id = ecg_id if ecg_id is not None else f"Prototype {prototype_idx}"
@@ -46,7 +53,7 @@ def log_ecg_to_tensorboard_1d(
     # Plot ECG
     fig = plot_ecg(
         raw_ecg=ecg_signal,
-        sampling_rate=100,
+        sampling_rate=sampling_rate,
         ecg_id=display_id,
         true_labels=true_label_names,
         prototype_labels=[class_1, class_2] if class_2 else [class_1],
@@ -60,7 +67,7 @@ def log_ecg_to_tensorboard_1d(
     # Highlight bottom rhythm strip 
     if highlight_rhythm:
         ax = fig.axes[0]
-        sampling_rate = 100
+        sampling_rate = sampling_rate
         highlight_start = 0
         highlight_end = ecg_signal.shape[0] / sampling_rate
 

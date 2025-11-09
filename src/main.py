@@ -11,6 +11,29 @@ if __name__ == '__main__':
     from proto_models2D import ProtoECGNet2D
     from fusion import FusionProtoClassifier, load_fusion_label_mappings, get_fusion_dataloaders
 
+    CUSTOM_BACKBONE_NAMES = []
+    try:
+        from custom_backbones import (
+            simple_cnn,
+            deep_cnn,
+            wide_cnn,
+            cnn_gru,
+            cnn_lstm,
+            cnn_transformer,
+            inception_cnn,
+        )
+        CUSTOM_BACKBONE_NAMES = [
+            "simple_cnn",
+            "deep_cnn",
+            "wide_cnn",
+            "cnn_gru",
+            "cnn_lstm",
+            "cnn_transformer",
+            "inception_cnn",
+        ]
+    except ImportError:
+        CUSTOM_BACKBONE_NAMES = []
+
     torch.set_float32_matmul_precision("high")
 
     def str2bool(v):
@@ -56,10 +79,12 @@ if __name__ == '__main__':
     parser.add_argument('--pretrained_weights', type=str, default=None, help='Path to pretrained model weights')
     parser.add_argument('--training_stage', type=str, choices=['feature_extractor', 'prototypes', 'joint', 'projection', 'classifier', 'fusion'], required=True)
     parser.add_argument('--dimension', type=str, choices=['1D', '2D'], required=True, help='Specify whether the model is 1D or 2D')
-    parser.add_argument('--backbone', type=str, choices=[
+    backbone_choices = [
         'resnet1d18', 'resnet1d34', 'resnet1d50', 'resnet1d101', 'resnet1d152',
         'resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152',
-    ], required=True, help='Specify the backbone architecture')
+    ] + CUSTOM_BACKBONE_NAMES
+    parser.add_argument('--backbone', type=str, choices=backbone_choices, required=True,
+                        help='Specify the backbone architecture')
     parser.add_argument('--single_class_prototype_per_class', type=int, default=5)
     parser.add_argument('--joint_prototypes_per_border', type=int, default=0) #not used in our paper
     parser.add_argument('--sampling_rate', type=int, choices=[100, 500], required=True) #we use 100 Hz
