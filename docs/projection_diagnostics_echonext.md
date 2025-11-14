@@ -52,6 +52,17 @@ python tools/echonext_projection_diagnostics.py --ptb-ckpt $CKPT \
 2. Compare class block stability in heatmaps vs PTB-XL baseline.
 3. Use reuse JSONs to quantify “80 → K” EchoNext samples under NN vs unique.
 
+### EchoNext collapse vs unique selection (what to look for)
+
+| Mode | Unique ECGs | Mean \|Δcos\| | Max \|Δcos\| | Reuse note |
+| --- | ---: | ---: | ---: | --- |
+| NN (unconstrained) | 3 | 0.668 | 0.998 | 70→`ecg_id=50364`, 10→`43071`, 5→`16486` (collapse) |
+| Unique (Hungarian) | 80 | 0.624 | 0.992 | 1 proto → 1 EchoNext ECG (no reuse) |
+
+- Unprojected cosine matrix keeps the 16×5 block structure; projecting onto EchoNext with NN collapses most prototypes onto a handful of “central” EchoNext embeddings, resulting in an almost all-ones heatmap and a single blob in PCA.
+- Unique assignment (Hungarian) forces 80 distinct EchoNext anchors, restoring block structure in the heatmap and spread in PCA, though the Δcos remains large, highlighting the PTB→EchoNext domain gap.
+- This contrast is exactly why both modes are shown: NN illustrates the unconstrained behavior (“80 → 3”), Unique shows the upper bound (“80 → 80”) without applying further constraints or pruning.
+
 ## Verification
 
 - 80 prototypes (16 × 5) for unprojected and both projections.

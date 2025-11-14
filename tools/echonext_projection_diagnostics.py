@@ -74,6 +74,8 @@ def plot_pca(tensor: torch.Tensor, labels: np.ndarray, out_path: Path, title: st
     comp = PCA(n_components=2, random_state=42).fit_transform(data)
     fig, ax = plt.subplots(figsize=(6.5, 5))
     scatter = ax.scatter(comp[:, 0], comp[:, 1], c=labels, s=30, cmap="tab20")
+    for idx, (x, y) in enumerate(comp):
+        ax.text(x, y, f"{idx}", fontsize=6, ha="center", va="center")
     ax.set_title(title)
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
