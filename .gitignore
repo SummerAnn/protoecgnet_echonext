@@ -1,0 +1,28 @@
+# run artifacts
+ptb_projection_rebuild/
+echonext_projection_rebuild/
+**/lead_attribution*/
+**/*_dup_summary.json
+**/*_diagnostics_manifest.json
+**/*.pt
+**/*.ckpt
+**/*.npy
+**/*.npz
+
+# generated CSV / JSON (diagnostics)
+**/*_proto_labels.csv
+**/*_prototype_metadata.json
+**/*_reuse.json
+**/*_manifest.json
+
+# plots
+**/*cosine_heatmap.png
+**/*pca.png
+**/*cosine_delta_hist*.png
+
+# caches
+standardization_cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
