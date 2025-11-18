@@ -16,9 +16,16 @@ from push import push_prototypes1d, push_prototypes2d
 import torch.nn.functional as F
 import itertools
 from collections import defaultdict
+from losses import AsymmetricLossMultiLabel
 
 
 def get_class_names(args):
+    # For EchoNext adaptation, get class names from the dataset
+    if args.training_stage == 'echonext_adapt':
+        # Return placeholder - will be set from dataset in ECGTrainer
+        # We'll need to pass this differently
+        return None  # Will be handled in ECGTrainer.__init__
+    
     from ecg_utils import load_label_mappings
 
     label_mappings = load_label_mappings(
@@ -61,7 +68,9 @@ def load_model_weights(model, checkpoint_path):
         print(f"Loaded model weights from {checkpoint_path}")
 
 class ECGTrainer(pl.LightningModule):
-    def __init__(self, model, lr=1e-3, l2=0, args=None, class_weights=None):
+    def __init__(self, model, lr=1e-3, l2=0, args=None, class_weights=None,
+                 loss_name="bce", asl_gamma_pos=0.0, asl_gamma_neg=4.0, asl_clip=0.05,
+                 asl_disable_pos_weight=False, use_class_weights=True):
         super().__init__()
         self.model = model
         self.lr = lr
@@ -70,8 +79,58 @@ class ECGTrainer(pl.LightningModule):
         self.is_proto = isinstance(model, (ProtoECGNet1D, ProtoECGNet2D, FusionProtoClassifier))
         self.class_weights = class_weights.to(self.device) if class_weights is not None else None
 
+        # Create classification criterion (ASL or BCE)
+        if loss_name == "asl":
+            pos_weight = None
+            if use_class_weights and (not asl_disable_pos_weight) and (self.class_weights is not None):
+                pos_weight = self.class_weights  # Tensor [C]; keep moderate (e.g., unclipped inverse-freq)
+            self.cls_criterion = AsymmetricLossMultiLabel(
+                gamma_pos=asl_gamma_pos,
+                gamma_neg=asl_gamma_neg,
+                clip=asl_clip,
+                reduction="mean",
+                pos_weight=pos_weight,
+            )
+            print(f"[ASL] Initialized: gamma_pos={asl_gamma_pos}, gamma_neg={asl_gamma_neg}, clip={asl_clip}, pos_weight={'enabled' if pos_weight is not None else 'disabled'}")
+        else:
+            # BCE baseline
+            self.cls_criterion = None  # Will use F.binary_cross_entropy_with_logits directly
+
         if self.args.training_stage in ["classifier", "fusion"]:
-            self.criterion = lambda logits, y, *_: torch.nn.BCEWithLogitsLoss(pos_weight=self.class_weights.to(logits.device) if class_weights is not None else None)(logits, y.to(logits.device)) + self.args.l1 * self.compute_l1_loss()
+            if self.cls_criterion is not None:
+                self.criterion = lambda logits, y, *_: self.cls_criterion(logits, y) + self.args.l1 * self.compute_l1_loss()
+            else:
+                self.criterion = lambda logits, y, *_: torch.nn.BCEWithLogitsLoss(pos_weight=self.class_weights.to(logits.device) if class_weights is not None else None)(logits, y.to(logits.device)) + self.args.l1 * self.compute_l1_loss()
+        elif self.args.training_stage == "echonext_adapt" and self.args.train_head_only:
+            # Head-only training: use classification loss only (no prototype losses)
+            if self.cls_criterion is not None:
+                self.criterion = lambda logits, y, *_: self.cls_criterion(logits, y)
+            else:
+                self.criterion = lambda logits, y, *_: torch.nn.BCEWithLogitsLoss(pos_weight=self.class_weights.to(logits.device) if class_weights is not None else None)(logits, y.to(logits.device))
+        elif self.args.training_stage == "echonext_adapt" and not self.args.train_head_only:
+            # Joint fine-tuning: encoder frozen, prototypes+head trainable
+            # Use EchoNext-specific loss with per-sample, per-class masking
+            if self.args.dimension == "1D":
+                from proto_models1D import prototype_loss1d_echonext
+                # Pass cls_criterion to prototype_loss1d_echonext
+                cls_crit = self.cls_criterion if self.cls_criterion is not None else None
+                self.criterion = lambda logits, y, model, similarity_scores: prototype_loss1d_echonext(
+                    logits=logits,
+                    y_true=y,
+                    model=model,
+                    similarity_scores=similarity_scores,
+                    lam_clst=self.args.lam_clst,
+                    lam_sep=self.args.lam_sep,
+                    lam_spars=self.args.lam_spars,
+                    lam_div=self.args.lam_div,
+                    lam_cnrst=self.args.lam_cnrst,
+                    class_weights=self.class_weights,
+                    use_contrastive=False,  # Disable contrastive for EchoNext
+                    cls_criterion=cls_crit  # Pass ASL criterion if available
+                )
+            else:
+                # 2D version would go here if needed
+                raise NotImplementedError("EchoNext adaptation for 2D models not implemented")
         elif self.args.training_stage in ["prototypes", "joint"]:
             if self.args.dimension == "1D":
                 self.criterion = lambda logits, y, model, similarity_scores: prototype_loss1d(
@@ -107,8 +166,20 @@ class ECGTrainer(pl.LightningModule):
         self.test_preds = []
         self.test_labels = []
         self.test_probs = []
-        self.class_names = get_class_names(args)
-        self.num_classes = len(self.class_names)
+        
+        # For EchoNext, get class names from dataset if available
+        if args.training_stage == 'echonext_adapt' and hasattr(args, 'dataset_root'):
+            # Try to get from train loader if available (will be set later)
+            self.class_names = None  # Will be set from dataset
+            # Get num_classes from model
+            if hasattr(model, 'num_classes'):
+                self.num_classes = model.num_classes
+            else:
+                # Fallback: try to infer from model output
+                self.num_classes = None
+        else:
+            self.class_names = get_class_names(args)
+            self.num_classes = len(self.class_names) if self.class_names else None
         self.save_hyperparameters(ignore=["model"]) 
     
     def compute_l1_loss(self):
@@ -143,12 +214,24 @@ class ECGTrainer(pl.LightningModule):
         
         elif self.args.training_stage in ["prototypes", "joint"]:
             logits, _, similarity_scores = output  # Extract similarity scores from the correct index
+        elif self.args.training_stage == "echonext_adapt":
+            # EchoNext adaptation: always returns (logits, distances, similarity_scores)
+            logits, _, similarity_scores = output
         
         elif self.args.training_stage == "classifier":
             logits, _, _ = output  # Classifier only returns logits
             similarity_scores = None
 
-        loss = self.criterion(logits, y, self.model, similarity_scores) if self.is_proto else self.criterion(logits, y)
+        # Loss computation based on training stage
+        if self.args.training_stage == "echonext_adapt" and self.args.train_head_only:
+            # Head-only: only BCE loss
+            loss = self.criterion(logits, y)
+        elif self.args.training_stage == "echonext_adapt" and not self.args.train_head_only:
+            # Joint fine-tuning: BCE + masked prototype losses
+            loss = self.criterion(logits, y, self.model, similarity_scores)
+        else:
+            # Standard PTB training
+            loss = self.criterion(logits, y, self.model, similarity_scores) if self.is_proto else self.criterion(logits, y)
         
         if torch.isnan(logits).any() or torch.isinf(logits).any():
             print("[DEBUG] Detected NaNs or Infs in logits!")
@@ -188,12 +271,24 @@ class ECGTrainer(pl.LightningModule):
         
         elif self.args.training_stage in ["prototypes", "joint"]:
             logits, _, similarity_scores = output  # Extract similarity scores from the correct index
+        elif self.args.training_stage == "echonext_adapt":
+            # EchoNext adaptation: always returns (logits, distances, similarity_scores)
+            logits, _, similarity_scores = output
         
         elif self.args.training_stage == "classifier":
             logits, _, _ = output  # Classifier only returns logits
             similarity_scores = None
             
-        loss = self.criterion(logits, y, self.model, similarity_scores) if self.is_proto else self.criterion(logits, y)
+        # Loss computation based on training stage
+        if self.args.training_stage == "echonext_adapt" and self.args.train_head_only:
+            # Head-only: only BCE loss
+            loss = self.criterion(logits, y)
+        elif self.args.training_stage == "echonext_adapt" and not self.args.train_head_only:
+            # Joint fine-tuning: BCE + masked prototype losses
+            loss = self.criterion(logits, y, self.model, similarity_scores)
+        else:
+            # Standard PTB training
+            loss = self.criterion(logits, y, self.model, similarity_scores) if self.is_proto else self.criterion(logits, y)
         
         probs = torch.sigmoid(logits).detach().cpu().numpy()
         self.val_preds.append(probs)
@@ -211,9 +306,33 @@ class ECGTrainer(pl.LightningModule):
 
         auc = self._compute_auc_epoch(all_preds, all_labels)
         f1 = f1_score(all_labels, (all_preds > 0.5).astype(int), average='micro')
+        
+        # Compute AUROC micro/macro and PR-AUC for EchoNext adaptation
+        auroc_micro = roc_auc_score(all_labels, all_preds, average='micro')
+        # Handle classes with only one label (skip them for macro average)
+        try:
+            auroc_macro = roc_auc_score(all_labels, all_preds, average='macro')
+        except ValueError as e:
+            if "Only one class present" in str(e):
+                # Compute per-class and skip classes with only one label
+                auroc_per_class = []
+                for c in range(all_labels.shape[1]):
+                    if len(np.unique(all_labels[:, c])) > 1:
+                        try:
+                            auroc_c = roc_auc_score(all_labels[:, c], all_preds[:, c])
+                            auroc_per_class.append(auroc_c)
+                        except:
+                            pass
+                auroc_macro = np.mean(auroc_per_class) if auroc_per_class else 0.0
+            else:
+                raise
+        pr_auc = average_precision_score(all_labels, all_preds, average='micro')
 
-        self.log("val_auc", auc, prog_bar=True, sync_dist=True)
+        # Rename val_auc to val_auroc_macro for consistency
+        self.log("val_auroc_macro", auroc_macro, prog_bar=True, sync_dist=True)
         self.log("val_f1", f1, prog_bar=True, sync_dist=True)
+        self.log("val_auroc_micro", auroc_micro, prog_bar=True, sync_dist=True)
+        self.log("val_auprc_micro", pr_auc, prog_bar=False, sync_dist=True)
 
         self.val_preds, self.val_labels = [], []  # Reset storage
 
@@ -231,12 +350,19 @@ class ECGTrainer(pl.LightningModule):
         
         elif self.args.training_stage in ["prototypes", "joint"]:
             logits, _, similarity_scores = output  # Extract similarity scores from the correct index
+        elif self.args.training_stage == "echonext_adapt":
+            # EchoNext adaptation: always returns (logits, distances, similarity_scores)
+            logits, _, similarity_scores = output
         
         elif self.args.training_stage == "classifier":
             logits, _, _ = output  # Classifier only returns logits
             similarity_scores = None
             
-        loss = self.criterion(logits, y, self.model, similarity_scores) if self.is_proto else self.criterion(logits, y)
+        # For head-only training, criterion only takes logits and y
+        if self.args.training_stage == "echonext_adapt" and self.args.train_head_only:
+            loss = self.criterion(logits, y)
+        else:
+            loss = self.criterion(logits, y, self.model, similarity_scores) if self.is_proto else self.criterion(logits, y)
 
         auc = self._compute_auc(logits, y)
         f1 = self._compute_f1(logits, y)
@@ -277,7 +403,14 @@ class ECGTrainer(pl.LightningModule):
         num_classes = all_preds.shape[1]
         df_dict = {"ID": np.arange(len(all_preds))} 
 
-        for i, class_name in enumerate(self.class_names):
+        # Handle EchoNext case where class_names might be None
+        if self.class_names is not None:
+            class_labels = self.class_names
+        else:
+            # Fallback to numeric indices
+            class_labels = [f"class_{i}" for i in range(num_classes)]
+
+        for i, class_name in enumerate(class_labels):
             df_dict[f"Label_{class_name}"] = all_labels[:, i]
             df_dict[f"Pred_{class_name}"] = all_preds[:, i]
             df_dict[f"Prob_{class_name}"] = all_probs[:, i]
@@ -348,26 +481,86 @@ class ECGTrainer(pl.LightningModule):
         return fig
     
     def configure_optimizers(self):
+        # Handle freezing for EchoNext adaptation
+        # Note: self.model is the ProtoECGNet model, not wrapped
+        if hasattr(self.args, 'freeze_encoder') and self.args.freeze_encoder:
+            if isinstance(self.model, (ProtoECGNet1D, ProtoECGNet2D)):
+                for param in self.model.feature_extractor.parameters():
+                    param.requires_grad = False
+                print("[VERIFY] Encoder frozen: feature_extractor parameters set to requires_grad=False")
+        
+        if hasattr(self.args, 'freeze_prototypes') and self.args.freeze_prototypes:
+            if isinstance(self.model, (ProtoECGNet1D, ProtoECGNet2D)):
+                self.model.prototype_vectors.requires_grad = False
+                print("[VERIFY] Prototypes frozen: prototype_vectors set to requires_grad=False")
+        
+        # Verify freeze/unfreeze state
+        if self.args.training_stage == 'echonext_adapt':
+            encoder_frozen = all(not p.requires_grad for p in self.model.feature_extractor.parameters())
+            prototypes_frozen = not self.model.prototype_vectors.requires_grad if hasattr(self.model, 'prototype_vectors') else True
+            head_trainable = any(p.requires_grad for p in self.model.classifier.parameters())
+            
+            if self.args.train_head_only:
+                assert encoder_frozen, "[ERROR] Encoder should be frozen in head-only training!"
+                assert prototypes_frozen, "[ERROR] Prototypes should be frozen in head-only training!"
+                assert head_trainable, "[ERROR] Head should be trainable in head-only training!"
+                print("[VERIFY] Head-only training: ✓ Encoder frozen, ✓ Prototypes frozen, ✓ Head trainable")
+            else:
+                # Joint fine-tuning: encoder frozen, prototypes+head trainable
+                assert encoder_frozen, "[ERROR] Encoder should be frozen in joint fine-tuning!"
+                assert not prototypes_frozen, "[ERROR] Prototypes should be trainable in joint fine-tuning!"
+                assert head_trainable, "[ERROR] Head should be trainable in joint fine-tuning!"
+                print("[VERIFY] Joint fine-tuning: ✓ Encoder frozen, ✓ Prototypes trainable, ✓ Head trainable")
+        
+        # Collect trainable parameters
         if self.args.training_stage == "prototypes":
-            optimizer = torch.optim.Adam([self.model.prototype_vectors], lr=self.lr, weight_decay=self.l2)
+            trainable_params = [self.model.prototype_vectors]
         elif self.args.training_stage in ["classifier", "fusion"]:
-            optimizer = torch.optim.Adam(self.model.classifier.parameters(), lr=self.lr, weight_decay=self.l2)
+            trainable_params = list(self.model.classifier.parameters())
+        elif self.args.training_stage == "echonext_adapt":
+            # For EchoNext adaptation, only train unfrozen parameters
+            trainable_params = []
+            if isinstance(self.model, (ProtoECGNet1D, ProtoECGNet2D)):
+                if not (hasattr(self.args, 'freeze_encoder') and self.args.freeze_encoder):
+                    trainable_params.extend(self.model.feature_extractor.parameters())
+                if not (hasattr(self.args, 'freeze_prototypes') and self.args.freeze_prototypes):
+                    trainable_params.append(self.model.prototype_vectors)
+                # Always train classifier
+                trainable_params.extend(self.model.classifier.parameters())
+            else:
+                trainable_params = list(self.model.parameters())
         else:  # Feature extractor and joint training
-            optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.l2)
+            trainable_params = list(self.model.parameters())
+        
+        optimizer = torch.optim.Adam(trainable_params, lr=self.lr, weight_decay=self.l2)
 
         # Apply scheduler based on the chosen type
         if self.args.scheduler_type == "ReduceLROnPlateau":
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
+            # For EchoNext, monitor val_auroc_micro if available, else val_loss
+            monitor_metric = "val_loss"
+            if self.args.training_stage == 'echonext_adapt':
+                # Try to use val_auroc_micro for ReduceLROnPlateau if available
+                monitor_metric = "val_auroc_micro"
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, 
+                mode="max" if monitor_metric.startswith("val_auroc") else "min",
+                factor=0.5, 
+                patience=2,
+                min_lr=1e-6,
+                verbose=True
+            )
+            return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "monitor": monitor_metric}}
         elif self.args.scheduler_type == "CosineAnnealingLR":
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.args.epochs)
+            eta_min = getattr(self.args, 'scheduler_eta_min', 1e-6)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.args.epochs, eta_min=eta_min)
+            return {"optimizer": optimizer, "lr_scheduler": scheduler}
         elif self.args.scheduler_type == "CyclicLR":
             base_lr = self.lr * 0.1  # Adjusting base_lr relative to the initial lr
             max_lr = self.lr * 10    # Allowing dynamic cycling of lr
             scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer, base_lr=base_lr, max_lr=max_lr, step_size_up=2000, mode="triangular")
+            return {"optimizer": optimizer, "lr_scheduler": scheduler}
         else:
             return optimizer  # No scheduler if none is chosen
-
-        return {"optimizer": optimizer, "lr_scheduler": scheduler, "monitor": "val_loss"}  # Monitor val_loss for schedulers
 
     def _compute_auc(self, logits, y):
         preds = torch.sigmoid(logits).detach().cpu().numpy()
@@ -428,22 +621,97 @@ class ECGTrainer(pl.LightningModule):
 
 
 def train_model(base_model, train_loader, val_loader, args, class_weights, trainer=None):
-    model = ECGTrainer(base_model, lr=args.lr, l2=args.l2, args=args, class_weights=class_weights)
+    # For EchoNext, set class names from dataset
+    if args.training_stage == 'echonext_adapt' and hasattr(train_loader.dataset, 'class_names'):
+        # Temporarily set class names in args for ECGTrainer
+        args._echonext_class_names = train_loader.dataset.class_names
+        args._echonext_num_classes = len(train_loader.dataset.class_names)
+    
+    # Extract ASL parameters from args
+    loss_name = getattr(args, 'loss', 'bce')
+    asl_gamma_pos = getattr(args, 'asl_gamma_pos', 0.0)
+    asl_gamma_neg = getattr(args, 'asl_gamma_neg', 4.0)
+    asl_clip = getattr(args, 'asl_clip', 0.05)
+    asl_disable_pos_weight = getattr(args, 'asl_disable_pos_weight', False)
+    use_class_weights = getattr(args, 'use_class_weights', True)
+    
+    model = ECGTrainer(
+        base_model, 
+        lr=args.lr, 
+        l2=args.l2, 
+        args=args, 
+        class_weights=class_weights,
+        loss_name=loss_name,
+        asl_gamma_pos=asl_gamma_pos,
+        asl_gamma_neg=asl_gamma_neg,
+        asl_clip=asl_clip,
+        asl_disable_pos_weight=asl_disable_pos_weight,
+        use_class_weights=use_class_weights,
+    )
+    
+    # Set class names from dataset if available
+    if args.training_stage == 'echonext_adapt' and hasattr(args, '_echonext_class_names'):
+        model.class_names = args._echonext_class_names
+        model.num_classes = args._echonext_num_classes
+        print(f"[INFO] Set class names from EchoNext dataset: {len(model.class_names)} classes")
 
     print(f"Starting training for job: {args.job_name}")
     print("Initializing TensorBoard Logger...")
 
     logger = TensorBoardLogger(args.log_dir, name=args.job_name)
+    
+    # Configure early stopping based on args
+    early_stop_metric = getattr(args, 'early_stop_metric', 'val_loss')
+    early_stop_patience = getattr(args, 'early_stop_patience', args.patience)
+    
+    # Determine checkpoint monitor metric
+    if args.training_stage == 'echonext_adapt':
+        # For EchoNext, use auroc_micro as default
+        checkpoint_monitor = 'val_auroc_micro' if early_stop_metric == 'auroc_micro' else 'val_auroc_macro'
+        checkpoint_filename = '{epoch}-{val_auroc_micro:.4f}' if early_stop_metric == 'auroc_micro' else '{epoch}-{val_auroc_macro:.4f}'
+    else:
+        # For PTB, use val_auroc_macro (renamed from val_auc)
+        checkpoint_monitor = 'val_auroc_macro'
+        checkpoint_filename = '{epoch}-{val_auroc_macro:.4f}'
+    
     checkpoint_callback = ModelCheckpoint(
         dirpath=os.path.join(args.checkpoint_dir, args.job_name),
-        filename='{epoch}-{val_auc:.4f}',
-        monitor='val_auc',
+        filename=checkpoint_filename,
+        monitor=checkpoint_monitor,
         mode='max',
         save_top_k=args.save_top_k,
         save_last=True
     )
-
-    early_stop_callback = EarlyStopping(monitor='val_auc', patience=args.patience, mode='max')
+    
+    # Optional: Add second checkpoint for best macro AUROC (if training EchoNext and save_both_checkpoints is True)
+    checkpoint_callback_macro = None
+    if args.training_stage == 'echonext_adapt' and getattr(args, 'save_both_checkpoints', False):
+        checkpoint_callback_macro = ModelCheckpoint(
+            dirpath=os.path.join(args.checkpoint_dir, args.job_name, 'best_macro'),
+            filename='epoch={epoch}-val_auroc_macro={val_auroc_macro:.4f}',
+            monitor='val_auroc_macro',
+            mode='max',
+            save_top_k=1,
+            save_last=False
+        )
+    
+    if early_stop_patience is not None and early_stop_patience > 0:
+        if early_stop_metric in ['auroc_micro', 'auroc_macro', 'pr_auc', 'auprc_micro']:
+            early_stop_callback = EarlyStopping(
+                monitor=f'val_{early_stop_metric}',
+                patience=early_stop_patience,
+                mode='max'
+            )
+        else:
+            early_stop_callback = EarlyStopping(
+                monitor=early_stop_metric,
+                patience=early_stop_patience,
+                mode='min' if 'loss' in early_stop_metric else 'max'
+            )
+    else:
+        # Fallback: use auroc_macro for PTB, auroc_micro for EchoNext
+        fallback_metric = 'val_auroc_micro' if args.training_stage == 'echonext_adapt' else 'val_auroc_macro'
+        early_stop_callback = EarlyStopping(monitor=fallback_metric, patience=args.patience, mode='max')
     lr_monitor = LearningRateMonitor(logging_interval='step')
     print("Initializing PyTorch Lightning Trainer...")
 
@@ -454,13 +722,23 @@ def train_model(base_model, train_loader, val_loader, args, class_weights, train
 
     # Use the provided trainer if given, otherwise create a new one 
     if trainer is None:
+        # For EchoNext with LAS sampler, disable distributed sampler injection
+        # since LabelAwareBatchSampler is a custom batch sampler
+        use_distributed_sampler = not (args.training_stage == 'echonext_adapt' and 
+                                      hasattr(args, 'sampler_mode') and 
+                                      args.sampler_mode == 'las')
+        callbacks_list = [checkpoint_callback, early_stop_callback, lr_monitor]
+        if checkpoint_callback_macro is not None:
+            callbacks_list.append(checkpoint_callback_macro)
+        
         trainer = pl.Trainer(
             max_epochs=args.epochs,
             accelerator="gpu" if torch.cuda.is_available() else "cpu",
             devices="auto",  
             strategy="auto",
             logger=logger,
-            callbacks=[checkpoint_callback, early_stop_callback, lr_monitor],
+            callbacks=callbacks_list,
+            use_distributed_sampler=use_distributed_sampler,
         )
    
     if args.training_stage == "feature_extractor":
@@ -496,6 +774,11 @@ def train_model(base_model, train_loader, val_loader, args, class_weights, train
             push_prototypes2d(model.model, train_loader, proj_dir, args.label_set, args.job_name, logger, device=args.device, custom_groups=args.custom_groups)
         save_model_weights(model, args.job_name, "projection", args.checkpoint_dir, args.save_weights)
 
+    elif args.training_stage == "echonext_adapt":
+        print("EchoNext adaptation training...")
+        # Freezing is handled in configure_optimizers and main.py
+        trainer.fit(model, train_loader, val_loader, ckpt_path="last" if args.resume_checkpoint else None)
+    
     elif args.training_stage == "classifier":
         print("Fine-tuning classifier (classifier-only training)...")
         for param in model.model.feature_extractor.parameters():
