@@ -1,0 +1,65 @@
+# EchoNext head-only baseline configuration
+# Trains only the classifier head with encoder and prototypes frozen
+
+job_name: echonext_head_only_baseline
+training_stage: echonext_adapt
+dimension: 1D
+backbone: resnet1d18
+
+# Dataset
+dataset_root: /opt/gpudata/ecg/echonext-v1.0.0
+train_split: train
+val_split: val
+label_set: cat1
+
+# Model
+pretrained_weights: /opt/gpudata/summereunann/ptbxl_weights/cat1.ckpt
+single_class_prototype_per_class: 5
+proto_dim: 512
+custom_groups: true
+
+# Freezing (head-only)
+train_head_only: true
+freeze_encoder: true
+freeze_prototypes: true
+
+# Loss (BCE only, no cluster/separation)
+lambda_cluster: 0.0
+lambda_separation: 0.0
+lam_clst: 0.0
+lam_sep: 0.0
+lam_spars: 0.0
+lam_div: 0.0
+lam_cnrst: 0.0
+
+# Training
+epochs: 5
+batch_size: 128
+lr: 3e-4
+l2: 0.0
+l1: 0.0
+seed: 42
+num_workers: 0
+
+# Early stopping
+early_stop_metric: auroc_micro
+early_stop_patience: 3
+
+# Export
+export_encoder_ts: null  # Set to path if needed, e.g., results/head_only/cat1.encoder.ts
+out_dir: results/head_only
+
+# Checkpointing
+checkpoint_dir: results/head_only/checkpoints
+log_dir: results/head_only/logs
+test_dir: results/head_only/test_results
+save_top_k: 3
+patience: 10
+
+# Other
+use_class_weights: true
+save_weights: true
+test_model: false
+device: cuda
+scheduler_type: ReduceLROnPlateau
+

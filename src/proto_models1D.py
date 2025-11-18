@@ -9,10 +9,113 @@ from backbones import (
     resnet1d101, resnet1d152
 )
 
+def prototype_loss1d_echonext(logits, y_true, model, similarity_scores, class_weights,
+                              lam_clst, lam_sep, lam_spars, lam_div, lam_cnrst, use_contrastive=False,
+                              cls_criterion=None):
+    """
+    EchoNext-specific prototype loss with per-sample, per-class masking.
+    
+    Key differences from PTB version:
+    - Cluster loss: masked to positive classes only (y==1), skipped for all-zero samples
+    - Separation loss: masked to negative classes only (y==0)
+    - Uses EchoNext labels directly, not PTB prototype_class_identity
+    
+    Args:
+        cls_criterion: Optional classification loss function (e.g., ASL). If None, uses BCE.
+    """
+    device = model.prototype_vectors.device
+    y_true = y_true.to(device).float()  # (B, C)
+    logits = logits.to(device)
+    similarity_scores = similarity_scores.to(device)  # (B, P)
+    if class_weights is not None:
+        class_weights = class_weights.to(device)
+    
+    B, C = y_true.shape
+    P = similarity_scores.shape[1]  # num_prototypes
+    
+    # Identify all-zero samples (no positive labels)
+    has_positives = y_true.sum(dim=1) > 0  # (B,)
+    
+    # Classification loss (always computed)
+    if cls_criterion is not None:
+        # Use provided criterion (e.g., ASL)
+        classification_loss = cls_criterion(logits, y_true)
+    else:
+        # Default: BCE
+        classification_loss = F.binary_cross_entropy_with_logits(logits, y_true, pos_weight=class_weights)
+    
+    # CLUSTER LOSS: Only for positive classes, skip all-zero samples
+    if lam_clst > 0 and has_positives.any():
+        # For each sample, find prototypes assigned to its positive classes
+        # prototype_class_identity: (P, C) - which classes each prototype belongs to
+        proto_class_assign = model.prototype_class_identity.float().to(device)  # (P, C)
+        
+        # For each sample, mask prototypes that match its positive classes
+        # y_true: (B, C), proto_class_assign: (P, C)
+        # We want: for each sample i, which prototypes match its positive classes?
+        # Match = prototype belongs to a class that sample i has positive
+        positive_mask = y_true.unsqueeze(1)  # (B, 1, C)
+        proto_assign_expanded = proto_class_assign.unsqueeze(0)  # (1, P, C)
+        
+        # For each (sample, prototype) pair: does prototype match any positive class?
+        matches_positive = (positive_mask * proto_assign_expanded).sum(dim=2) > 0  # (B, P)
+        
+        # Get activations for matching prototypes
+        matching_activations = similarity_scores * matches_positive.float()  # (B, P)
+        
+        # Max activation per sample (only among matching prototypes)
+        max_matching_activations, _ = torch.max(matching_activations, dim=1)  # (B,)
+        
+        # Only compute loss for samples with positives
+        if has_positives.any():
+            clst_loss = -torch.mean(max_matching_activations[has_positives])
+        else:
+            clst_loss = torch.tensor(0.0, device=device)
+    else:
+        clst_loss = torch.tensor(0.0, device=device)
+    
+    # SEPARATION LOSS: Only for negative classes (y==0)
+    if lam_sep > 0:
+        proto_class_assign = model.prototype_class_identity.float().to(device)  # (P, C)
+        
+        # For each sample, find prototypes assigned to its negative classes
+        negative_mask = (1.0 - y_true).unsqueeze(1)  # (B, 1, C) - 1 where class is negative
+        proto_assign_expanded = proto_class_assign.unsqueeze(0)  # (1, P, C)
+        
+        # For each (sample, prototype) pair: does prototype match any negative class?
+        matches_negative = (negative_mask * proto_assign_expanded).sum(dim=2) > 0  # (B, P)
+        
+        # Get activations for prototypes matching negative classes
+        negative_activations = similarity_scores * matches_negative.float()  # (B, P)
+        
+        # Max activation per sample (among prototypes matching negatives)
+        max_negative_activations, _ = torch.max(negative_activations, dim=1)  # (B,)
+        
+        # Only compute for samples that have at least one negative class
+        has_negatives = (y_true.sum(dim=1) < C).float()  # (B,) - at least one class is 0
+        if has_negatives.sum() > 0:
+            sep_loss = torch.mean(max_negative_activations * has_negatives) / (has_negatives.sum() + 1e-6)
+        else:
+            sep_loss = torch.tensor(0.0, device=device)
+    else:
+        sep_loss = torch.tensor(0.0, device=device)
+    
+    # Sparsity, diversity, contrastive losses (unchanged)
+    spars_loss = torch.mean(torch.clamp(similarity_scores, min=0).sum(dim=1))
+    
+    P_norm = F.normalize(model.prototype_vectors, p=2, dim=1)  # (P, D)
+    identity_matrix = torch.eye(P, device=device)
+    div_loss = torch.norm(torch.mm(P_norm, P_norm.T) - identity_matrix, p="fro") ** 2 / (P ** 2)
+    
+    cnrst_loss = torch.tensor(0.0, device=device)  # Disabled for EchoNext
+    
+    return classification_loss + lam_clst * clst_loss + lam_sep * sep_loss + lam_spars * spars_loss + lam_div * div_loss + lam_cnrst * cnrst_loss
+
+
 def prototype_loss1d(logits, y_true, model, similarity_scores, class_weights, 
                    lam_clst, lam_sep, lam_spars, lam_div, lam_cnrst, use_contrastive=True):
     """
-    Prototype-based loss function for ProtoECGNet1D.
+    Prototype-based loss function for ProtoECGNet1D (PTB-XL version).
     - Uses precomputed similarity scores from the model's forward pass.
     """
 
@@ -97,7 +200,7 @@ def prototype_loss1d(logits, y_true, model, similarity_scores, class_weights,
 class ProtoECGNet1D(nn.Module):
     def __init__(self, backbone="resnet1d18", num_classes=5, single_class_prototype_per_class=5, joint_prototypes_per_border=2, proto_dim=512, 
                 prototype_activation_function="log", latent_space_type="l2", add_on_layers_type="linear", class_specific=False, last_layer_connection_weight=None, m=None, dropout=0, 
-                custom_groups=True, label_set='all', pretrained_weights=None):
+                custom_groups=True, label_set='all', pretrained_weights=None, load_strict=True):
    
         super().__init__()
         self.joint_prototypes_per_border = joint_prototypes_per_border
@@ -203,6 +306,21 @@ class ProtoECGNet1D(nn.Module):
             else: 
                 self.prototype_class_identity = torch.zeros(self.num_prototypes, self.num_classes)
 
+            # For EchoNext adaptation, filter out incompatible keys if num_classes differs
+            if not load_strict:
+                # Remove classifier and prototype_class_identity if shapes don't match
+                filtered_dict = {}
+                for k, v in new_state_dict.items():
+                    if k == "classifier.weight" and v.shape != self.classifier.weight.shape:
+                        print(f"[INFO] Skipping {k} (shape mismatch: {v.shape} vs {self.classifier.weight.shape})")
+                        continue
+                    elif k == "prototype_class_identity" and v.shape != self.prototype_class_identity.shape:
+                        print(f"[INFO] Skipping {k} (shape mismatch: {v.shape} vs {self.prototype_class_identity.shape})")
+                        continue
+                    filtered_dict[k] = v
+                new_state_dict = filtered_dict
+                print(f"[INFO] Loading checkpoint with strict=False (filtered incompatible keys)")
+
             # print(f"[DEBUG] Checkpoint Keys: {list(new_state_dict.keys())}") 
             # if "prototype_class_identity" in new_state_dict:
             #     print(f"[DEBUG] Loaded Prototype Class Identity Matrix Shape: {self.prototype_class_identity.shape}")
@@ -210,7 +328,10 @@ class ProtoECGNet1D(nn.Module):
             # else:
             #     print("[WARNING] No `prototype_class_identity` found in checkpoint! Using initialized values.")
 
-            self.load_state_dict(new_state_dict, strict=True)
+            # For EchoNext adaptation, we may have different num_classes, so use load_strict parameter
+            self.load_state_dict(new_state_dict, strict=load_strict)
+            if not load_strict:
+                print(f"[INFO] Loaded checkpoint with strict=False (classifier reinitialized for {num_classes} classes)")
 
     def _create_prototype_labels(self, num_classes, single_class_prototype_per_class, joint_prototypes_per_border):
         """Assigns class identities to prototypes (single-class & dual-class) and prints debugging info."""
