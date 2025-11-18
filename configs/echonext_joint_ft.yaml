@@ -1,0 +1,66 @@
+# EchoNext joint fine-tuning configuration
+# Fine-tunes prototypes + head with encoder frozen
+
+job_name: echonext_joint_ft
+training_stage: echonext_adapt
+dimension: 1D
+backbone: resnet1d18
+
+# Dataset
+dataset_root: /opt/gpudata/ecg/echonext-v1.0.0
+train_split: train
+val_split: val
+label_set: cat1
+
+# Model
+pretrained_weights: /opt/gpudata/summereunann/ptbxl_weights/cat1.ckpt
+single_class_prototype_per_class: 5
+proto_dim: 512
+custom_groups: true
+
+# Freezing (encoder frozen, prototypes + head trainable)
+train_head_only: false
+freeze_encoder: true
+freeze_prototypes: false
+
+# Loss (BCE + cluster + separation)
+lambda_cluster: 0.8
+lambda_separation: 0.1
+lam_clst: 0.8
+lam_sep: 0.1
+lam_spars: 0.0
+lam_div: 0.0
+lam_cnrst: 0.0
+topk_push: 5
+
+# Training
+epochs: 10
+batch_size: 64
+lr: 1e-4
+l2: 0.0
+l1: 0.0
+seed: 42
+num_workers: 0
+
+# Early stopping
+early_stop_metric: auroc_micro
+early_stop_patience: 3
+
+# Export
+export_encoder_ts: null  # Set to path if needed, e.g., results/joint_ft/cat1.encoder.ts
+out_dir: results/joint_ft
+
+# Checkpointing
+checkpoint_dir: results/joint_ft/checkpoints
+log_dir: results/joint_ft/logs
+test_dir: results/joint_ft/test_results
+save_top_k: 3
+patience: 10
+
+# Other
+use_class_weights: true
+save_weights: true
+test_model: false
+device: cuda
+scheduler_type: ReduceLROnPlateau
+
