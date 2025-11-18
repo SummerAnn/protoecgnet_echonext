@@ -80,7 +80,7 @@ printf "Unique\t%s\t%s\t%s\n" "$UNI_UNIQ" "$MEAN_U" "$MAX_U"
 
 - Unprojected cosine matrix retains the 16×5 block structure; projecting onto EchoNext with NN collapses most prototypes onto a handful of “central” embeddings, yielding an almost all-ones heatmap and a single blob in PCA.
 - Unique assignment forces 80 distinct anchors, restoring block structure and PCA spread, though the Δcos remains large, highlighting the PTB→EchoNext domain gap.
-- Showing both modes answers the reviewer ask: NN (unconstrained, “80 → 3”) vs Unique (upper bound, “80 → 80”).
+- Showing both modes answers the question: NN (unconstrained, "80 → 3") vs Unique (upper bound, "80 → 80").
 
 ## Verification
 
@@ -91,7 +91,7 @@ printf "Unique\t%s\t%s\t%s\n" "$UNI_UNIQ" "$MEAN_U" "$MAX_U"
 
 ## Troubleshooting
 
-- Missing EchoNext dataset assets → check `$ECHONEXT` path.
+- Missing EchoNext datasetx assets → check `$ECHONEXT` path.
 - Hungarian fallback triggered → install `scipy>=1.10` or document greedy fallback.
 - CUDA mismatch → re-run with `--device cpu --limit 5` for smoke tests.
 - No SciPy? Unique mode automatically falls back to greedy 1:1 and records `selection_method` in the manifest.
